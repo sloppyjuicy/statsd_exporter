@@ -15,14 +15,15 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"reflect"
 	"testing"
 	"time"
 
-	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/promslog"
 
 	"github.com/prometheus/statsd_exporter/pkg/clock"
 	"github.com/prometheus/statsd_exporter/pkg/event"
@@ -77,6 +78,58 @@ func TestHandlePacket(t *testing.T) {
 				&event.GaugeEvent{
 					GMetricName: "foo",
 					GValue:      -10,
+					GRelative:   true,
+					GLabels:     map[string]string{},
+				},
+			},
+		}, {
+			name: "gauge increment",
+			in:   "foo:+10|g",
+			out: event.Events{
+				&event.GaugeEvent{
+					GMetricName: "foo",
+					GValue:      10,
+					GRelative:   true,
+					GLabels:     map[string]string{},
+				},
+			},
+		}, {
+			name: "gauge set negative",
+			in:   "foo:0|g\nfoo:-1|g",
+			out: event.Events{
+				&event.GaugeEvent{
+					GMetricName: "foo",
+					GValue:      0,
+					GRelative:   false,
+					GLabels:     map[string]string{},
+				},
+				&event.GaugeEvent{
+					GMetricName: "foo",
+					GValue:      -1,
+					GRelative:   true,
+					GLabels:     map[string]string{},
+				},
+			},
+		}, {
+			// Test the sequence given here https://github.com/statsd/statsd/blob/master/docs/metric_types.md#gauges
+			name: "gauge up and down",
+			in:   "gaugor:333|g\ngaugor:-10|g\ngaugor:+4|g",
+			out: event.Events{
+				&event.GaugeEvent{
+					GMetricName: "gaugor",
+					GValue:      333,
+					GRelative:   false,
+					GLabels:     map[string]string{},
+				},
+				&event.GaugeEvent{
+					GMetricName: "gaugor",
+					GValue:      -10,
+					GRelative:   true,
+					GLabels:     map[string]string{},
+				},
+				&event.GaugeEvent{
+					GMetricName: "gaugor",
+					GValue:      4,
 					GRelative:   true,
 					GLabels:     map[string]string{},
 				},
@@ -540,9 +593,10 @@ func TestHandlePacket(t *testing.T) {
 	for k, l := range []statsDPacketHandler{&listener.StatsDUDPListener{
 		Conn:            nil,
 		EventHandler:    nil,
-		Logger:          log.NewNopLogger(),
+		Logger:          promslog.NewNopLogger(),
 		LineParser:      parser,
 		UDPPackets:      udpPackets,
+		UDPPacketDrops:  udpPacketDrops,
 		LinesReceived:   linesReceived,
 		EventsFlushed:   eventsFlushed,
 		SampleErrors:    *sampleErrors,
@@ -552,7 +606,7 @@ func TestHandlePacket(t *testing.T) {
 	}, &mockStatsDTCPListener{listener.StatsDTCPListener{
 		Conn:            nil,
 		EventHandler:    nil,
-		Logger:          log.NewNopLogger(),
+		Logger:          promslog.NewNopLogger(),
 		LineParser:      parser,
 		LinesReceived:   linesReceived,
 		EventsFlushed:   eventsFlushed,
@@ -563,7 +617,7 @@ func TestHandlePacket(t *testing.T) {
 		TCPConnections:  tcpConnections,
 		TCPErrors:       tcpErrors,
 		TCPLineTooLong:  tcpLineTooLong,
-	}, log.NewNopLogger()}} {
+	}, promslog.NewNopLogger()}} {
 		events := make(chan event.Events, 32)
 		l.SetEventHandler(&event.UnbufferedEventHandler{C: events})
 		for i, scenario := range scenarios {
@@ -596,7 +650,7 @@ type statsDPacketHandler interface {
 
 type mockStatsDTCPListener struct {
 	listener.StatsDTCPListener
-	log.Logger
+	*slog.Logger
 }
 
 func (ml *mockStatsDTCPListener) HandlePacket(packet []byte) {
@@ -657,7 +711,7 @@ mappings:
 	events := make(chan event.Events)
 	defer close(events)
 	go func() {
-		ex := exporter.NewExporter(prometheus.DefaultRegisterer, testMapper, log.NewNopLogger(), eventsActions, eventsUnmapped, errorEventStats, eventStats, conflictingEventStats, metricsCount)
+		ex := exporter.NewExporter(prometheus.DefaultRegisterer, testMapper, promslog.NewNopLogger(), eventsActions, eventsUnmapped, errorEventStats, eventStats, conflictingEventStats, metricsCount)
 		ex.Listen(events)
 	}()
 
