@@ -14,15 +14,14 @@
 package exporter
 
 import (
+	"log/slog"
 	"os"
 	"time"
 
-	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/prometheus/statsd_exporter/pkg/clock"
 	"github.com/prometheus/statsd_exporter/pkg/event"
-	"github.com/prometheus/statsd_exporter/pkg/level"
 	"github.com/prometheus/statsd_exporter/pkg/mapper"
 	"github.com/prometheus/statsd_exporter/pkg/registry"
 )
@@ -43,7 +42,7 @@ type Registry interface {
 type Exporter struct {
 	Mapper                *mapper.MetricMapper
 	Registry              Registry
-	Logger                log.Logger
+	Logger                *slog.Logger
 	EventsActions         *prometheus.CounterVec
 	EventsUnmapped        prometheus.Counter
 	ErrorEventStats       *prometheus.CounterVec
@@ -63,7 +62,7 @@ func (b *Exporter) Listen(e <-chan event.Events) {
 			b.Registry.RemoveStaleMetrics()
 		case events, ok := <-e:
 			if !ok {
-				level.Debug(b.Logger).Log("msg", "Channel is closed. Break out of Exporter.Listener.")
+				b.Logger.Debug("Channel is closed. Break out of Exporter.Listener.")
 				removeStaleMetricsTicker.Stop()
 				return
 			}
@@ -99,12 +98,16 @@ func (b *Exporter) handleEvent(thisEvent event.Event) {
 	prometheusLabels := thisEvent.Labels()
 	if present {
 		if mapping.Name == "" {
-			level.Debug(b.Logger).Log("msg", "The mapping generates an empty metric name", "metric_name", thisEvent.MetricName(), "match", mapping.Match)
+			b.Logger.Debug("The mapping generates an empty metric name", "metric_name", thisEvent.MetricName(), "match", mapping.Match)
 			b.ErrorEventStats.WithLabelValues("empty_metric_name").Inc()
 			return
 		}
 		metricName = mapper.EscapeMetricName(mapping.Name)
 		for label, value := range labels {
+			if _, ok := prometheusLabels[label]; mapping.HonorLabels && ok {
+				continue
+			}
+
 			prometheusLabels[label] = value
 		}
 		b.EventsActions.WithLabelValues(string(mapping.Action)).Inc()
@@ -113,23 +116,28 @@ func (b *Exporter) handleEvent(thisEvent event.Event) {
 		metricName = mapper.EscapeMetricName(thisEvent.MetricName())
 	}
 
+	eventValue := thisEvent.Value()
+	if mapping.Scale.Set {
+		eventValue *= mapping.Scale.Val
+	}
+
 	switch ev := thisEvent.(type) {
 	case *event.CounterEvent:
 		// We don't accept negative values for counters. Incrementing the counter with a negative number
 		// will cause the exporter to panic. Instead we will warn and continue to the next event.
-		if thisEvent.Value() < 0.0 {
-			level.Debug(b.Logger).Log("msg", "counter must be non-negative value", "metric", metricName, "event_value", thisEvent.Value())
+		if eventValue < 0.0 {
+			b.Logger.Debug("counter must be non-negative value", "metric", metricName, "event_value", eventValue)
 			b.ErrorEventStats.WithLabelValues("illegal_negative_counter").Inc()
 			return
 		}
 
 		counter, err := b.Registry.GetCounter(metricName, prometheusLabels, help, mapping, b.MetricsCount)
 		if err == nil {
-			counter.Add(thisEvent.Value())
+			counter.Add(eventValue)
 			b.EventStats.WithLabelValues("counter").Inc()
 		} else {
-			level.Debug(b.Logger).Log("msg", regErrF, "metric", metricName, "error", err)
-			b.ConflictingEventStats.WithLabelValues("counter").Inc()
+			b.Logger.Debug(regErrF, "metric", metricName, "error", err)
+			b.ConflictingEventStats.WithLabelValues("counter", metricName).Inc()
 		}
 
 	case *event.GaugeEvent:
@@ -137,14 +145,14 @@ func (b *Exporter) handleEvent(thisEvent event.Event) {
 
 		if err == nil {
 			if ev.GRelative {
-				gauge.Add(thisEvent.Value())
+				gauge.Add(eventValue)
 			} else {
-				gauge.Set(thisEvent.Value())
+				gauge.Set(eventValue)
 			}
 			b.EventStats.WithLabelValues("gauge").Inc()
 		} else {
-			level.Debug(b.Logger).Log("msg", regErrF, "metric", metricName, "error", err)
-			b.ConflictingEventStats.WithLabelValues("gauge").Inc()
+			b.Logger.Debug(regErrF, "metric", metricName, "error", err)
+			b.ConflictingEventStats.WithLabelValues("gauge", metricName).Inc()
 		}
 
 	case *event.ObserverEvent:
@@ -160,35 +168,35 @@ func (b *Exporter) handleEvent(thisEvent event.Event) {
 		case mapper.ObserverTypeHistogram:
 			histogram, err := b.Registry.GetHistogram(metricName, prometheusLabels, help, mapping, b.MetricsCount)
 			if err == nil {
-				histogram.Observe(thisEvent.Value())
+				histogram.Observe(eventValue)
 				b.EventStats.WithLabelValues("observer").Inc()
 			} else {
-				level.Debug(b.Logger).Log("msg", regErrF, "metric", metricName, "error", err)
-				b.ConflictingEventStats.WithLabelValues("observer").Inc()
+				b.Logger.Debug(regErrF, "metric", metricName, "error", err)
+				b.ConflictingEventStats.WithLabelValues("observer", metricName).Inc()
 			}
 
 		case mapper.ObserverTypeDefault, mapper.ObserverTypeSummary:
 			summary, err := b.Registry.GetSummary(metricName, prometheusLabels, help, mapping, b.MetricsCount)
 			if err == nil {
-				summary.Observe(thisEvent.Value())
+				summary.Observe(eventValue)
 				b.EventStats.WithLabelValues("observer").Inc()
 			} else {
-				level.Debug(b.Logger).Log("msg", regErrF, "metric", metricName, "error", err)
-				b.ConflictingEventStats.WithLabelValues("observer").Inc()
+				b.Logger.Debug(regErrF, "metric", metricName, "error", err)
+				b.ConflictingEventStats.WithLabelValues("observer", metricName).Inc()
 			}
 
 		default:
-			level.Error(b.Logger).Log("msg", "unknown observer type", "type", t)
+			b.Logger.Error("unknown observer type", "type", t)
 			os.Exit(1)
 		}
 
 	default:
-		level.Debug(b.Logger).Log("msg", "Unsupported event type")
+		b.Logger.Debug("Unsupported event type")
 		b.EventStats.WithLabelValues("illegal").Inc()
 	}
 }
 
-func NewExporter(reg prometheus.Registerer, mapper *mapper.MetricMapper, logger log.Logger, eventsActions *prometheus.CounterVec, eventsUnmapped prometheus.Counter, errorEventStats *prometheus.CounterVec, eventStats *prometheus.CounterVec, conflictingEventStats *prometheus.CounterVec, metricsCount *prometheus.GaugeVec) *Exporter {
+func NewExporter(reg prometheus.Registerer, mapper *mapper.MetricMapper, logger *slog.Logger, eventsActions *prometheus.CounterVec, eventsUnmapped prometheus.Counter, errorEventStats *prometheus.CounterVec, eventStats *prometheus.CounterVec, conflictingEventStats *prometheus.CounterVec, metricsCount *prometheus.GaugeVec) *Exporter {
 	return &Exporter{
 		Mapper:                mapper,
 		Registry:              registry.NewRegistry(reg, mapper),
