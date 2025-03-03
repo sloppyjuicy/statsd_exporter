@@ -16,28 +16,28 @@ package listener
 import (
 	"bufio"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"strings"
 
-	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/prometheus/statsd_exporter/pkg/event"
-	"github.com/prometheus/statsd_exporter/pkg/level"
 	"github.com/prometheus/statsd_exporter/pkg/relay"
 )
 
 type Parser interface {
-	LineToEvents(line string, sampleErrors prometheus.CounterVec, samplesReceived prometheus.Counter, tagErrors prometheus.Counter, tagsReceived prometheus.Counter, logger log.Logger) event.Events
+	LineToEvents(line string, sampleErrors prometheus.CounterVec, samplesReceived prometheus.Counter, tagErrors prometheus.Counter, tagsReceived prometheus.Counter, logger *slog.Logger) event.Events
 }
 
 type StatsDUDPListener struct {
 	Conn            *net.UDPConn
 	EventHandler    event.EventHandler
-	Logger          log.Logger
+	Logger          *slog.Logger
 	LineParser      Parser
 	UDPPackets      prometheus.Counter
+	UDPPacketDrops  prometheus.Counter
 	LinesReceived   prometheus.Counter
 	EventsFlushed   prometheus.Counter
 	Relay           *relay.Relay
@@ -45,6 +45,7 @@ type StatsDUDPListener struct {
 	SamplesReceived prometheus.Counter
 	TagErrors       prometheus.Counter
 	TagsReceived    prometheus.Counter
+	UdpPacketQueue  chan []byte
 }
 
 func (l *StatsDUDPListener) SetEventHandler(eh event.EventHandler) {
@@ -53,6 +54,7 @@ func (l *StatsDUDPListener) SetEventHandler(eh event.EventHandler) {
 
 func (l *StatsDUDPListener) Listen() {
 	buf := make([]byte, 65535)
+	go l.ProcessUdpPacketQueue()
 	for {
 		n, _, err := l.Conn.ReadFromUDP(buf)
 		if err != nil {
@@ -61,18 +63,37 @@ func (l *StatsDUDPListener) Listen() {
 			if strings.HasSuffix(err.Error(), "use of closed network connection") {
 				return
 			}
-			level.Error(l.Logger).Log("error", err)
+			l.Logger.Error("error reading from UDP connection", "err", err)
 			return
 		}
-		l.HandlePacket(buf[0:n])
+
+		l.EnqueueUdpPacket(buf, n)
+	}
+}
+
+func (l *StatsDUDPListener) EnqueueUdpPacket(packet []byte, n int) {
+	l.UDPPackets.Inc()
+	packetCopy := make([]byte, n)
+	copy(packetCopy, packet)
+	select {
+	case l.UdpPacketQueue <- packetCopy:
+		// do nothing
+	default:
+		l.UDPPacketDrops.Inc()
+	}
+}
+
+func (l *StatsDUDPListener) ProcessUdpPacketQueue() {
+	for {
+		packet := <-l.UdpPacketQueue
+		l.HandlePacket(packet)
 	}
 }
 
 func (l *StatsDUDPListener) HandlePacket(packet []byte) {
-	l.UDPPackets.Inc()
 	lines := strings.Split(string(packet), "\n")
 	for _, line := range lines {
-		level.Debug(l.Logger).Log("msg", "Incoming line", "proto", "udp", "line", line)
+		l.Logger.Debug("Incoming line", "proto", "udp", "line", line)
 		l.LinesReceived.Inc()
 		if l.Relay != nil && len(line) > 0 {
 			l.Relay.RelayLine(line)
@@ -84,7 +105,7 @@ func (l *StatsDUDPListener) HandlePacket(packet []byte) {
 type StatsDTCPListener struct {
 	Conn            *net.TCPListener
 	EventHandler    event.EventHandler
-	Logger          log.Logger
+	Logger          *slog.Logger
 	LineParser      Parser
 	LinesReceived   prometheus.Counter
 	EventsFlushed   prometheus.Counter
@@ -111,7 +132,7 @@ func (l *StatsDTCPListener) Listen() {
 			if strings.HasSuffix(err.Error(), "use of closed network connection") {
 				return
 			}
-			level.Error(l.Logger).Log("msg", "AcceptTCP failed", "error", err)
+			l.Logger.Error("AcceptTCP failed", "error", err)
 			os.Exit(1)
 		}
 		go l.HandleConn(c)
@@ -129,14 +150,14 @@ func (l *StatsDTCPListener) HandleConn(c *net.TCPConn) {
 		if err != nil {
 			if err != io.EOF {
 				l.TCPErrors.Inc()
-				level.Debug(l.Logger).Log("msg", "Read failed", "addr", c.RemoteAddr(), "error", err)
+				l.Logger.Debug("Read failed", "addr", c.RemoteAddr(), "error", err)
 			}
 			break
 		}
-		level.Debug(l.Logger).Log("msg", "Incoming line", "proto", "tcp", "line", line)
+		l.Logger.Debug("Incoming line", "proto", "tcp", "line", string(line))
 		if isPrefix {
 			l.TCPLineTooLong.Inc()
-			level.Debug(l.Logger).Log("msg", "Read failed: line too long", "addr", c.RemoteAddr())
+			l.Logger.Debug("Read failed: line too long", "addr", c.RemoteAddr())
 			break
 		}
 		l.LinesReceived.Inc()
@@ -150,7 +171,7 @@ func (l *StatsDTCPListener) HandleConn(c *net.TCPConn) {
 type StatsDUnixgramListener struct {
 	Conn            *net.UnixConn
 	EventHandler    event.EventHandler
-	Logger          log.Logger
+	Logger          *slog.Logger
 	LineParser      Parser
 	UnixgramPackets prometheus.Counter
 	LinesReceived   prometheus.Counter
@@ -176,7 +197,7 @@ func (l *StatsDUnixgramListener) Listen() {
 			if strings.HasSuffix(err.Error(), "use of closed network connection") {
 				return
 			}
-			level.Error(l.Logger).Log(err)
+			l.Logger.Error("error reading from unixgram connection", "err", err)
 			os.Exit(1)
 		}
 		l.HandlePacket(buf[:n])
@@ -187,7 +208,7 @@ func (l *StatsDUnixgramListener) HandlePacket(packet []byte) {
 	l.UnixgramPackets.Inc()
 	lines := strings.Split(string(packet), "\n")
 	for _, line := range lines {
-		level.Debug(l.Logger).Log("msg", "Incoming line", "proto", "unixgram", "line", line)
+		l.Logger.Debug("Incoming line", "proto", "unixgram", "line", line)
 		l.LinesReceived.Inc()
 		if l.Relay != nil && len(line) > 0 {
 			l.Relay.RelayLine(line)

@@ -79,8 +79,9 @@ in the DogStatsD documentation for the concept description and
 [Datagram Format](https://docs.datadoghq.com/developers/dogstatsd/datagram_shell/).
 If you encounter problems, note that this tagging style is incompatible with
 the original `statsd` implementation.
+The exporter also supports [DogStatD extended aggregations](https://github.com/prometheus/statsd_exporter/pull/558) in combination with DogStatsD tags, but not other tagging styles.
 
-For [SignalFX dimension](https://docs.signalfx.com/en/latest/integrations/agent/monitors/collectd-statsd.html#adding-dimensions-to-statsd-metrics), add the tags to the metric name in square brackets, as so:
+For [SignalFX dimension](https://github.com/signalfx/signalfx-agent/blob/main/docs/monitors/collectd-statsd.md#adding-dimensions-to-statsd-metrics), add the tags to the metric name in square brackets, as so:
 
 ```
 metric.name[tagName=val,tag2Name=val2]:0|c
@@ -97,6 +98,9 @@ The exporter parses all tagging formats by default, but individual tagging forma
 --no-statsd.parse-signalfx-tags
 ```
 
+By default, labels explicitly specified in configuration take precedence over labels from tags.
+To set the label from the statsd event tag, use [`honor_labels`](#honor-labels).
+
 ## Building and Running
 
 NOTE: Version 0.7.0 switched to the [kingpin](https://github.com/alecthomas/kingpin) flags library. With this change, flag behaviour is POSIX-ish:
@@ -105,71 +109,7 @@ NOTE: Version 0.7.0 switched to the [kingpin](https://github.com/alecthomas/king
 * boolean long flags are disabled by prefixing with no (`--flag-name` is true, `--no-flag-name` is false)
 * multiple short flags can be combined (but there currently is only one)
 * flag processing stops at the first `--`
-
-    ```
-    usage: statsd_exporter [<flags>]
-
-    Flags:
-      -h, --help                    Show context-sensitive help (also try
-                                    --help-long and --help-man).
-          --web.listen-address=":9102"
-                                    The address on which to expose the web interface
-                                    and generated Prometheus metrics.
-          --web.enable-lifecycle    Enable shutdown and reload via HTTP request.
-          --web.telemetry-path="/metrics"
-                                    Path under which to expose metrics.
-          --statsd.listen-udp=":9125"
-                                    The UDP address on which to receive statsd
-                                    metric lines. "" disables it.
-          --statsd.listen-tcp=":9125"
-                                    The TCP address on which to receive statsd
-                                    metric lines. "" disables it.
-          --statsd.listen-unixgram=""
-                                    The Unixgram socket path to receive statsd
-                                    metric lines in datagram. "" disables it.
-          --statsd.unixsocket-mode="755"
-                                    The permission mode of the unix socket.
-          --statsd.mapping-config=STATSD.MAPPING-CONFIG
-                                    Metric mapping configuration file name.
-          --statsd.read-buffer=STATSD.READ-BUFFER
-                                    Size (in bytes) of the operating system's
-                                    transmit read buffer associated with the UDP or
-                                    Unixgram connection. Please make sure the kernel
-                                    parameters net.core.rmem_max is set to a value
-                                    greater than the value specified.
-          --statsd.cache-size=1000  Maximum size of your metric mapping cache.
-                                    Relies on least recently used replacement policy
-                                    if max size is reached.
-          --statsd.cache-type=lru   Metric mapping cache type. Valid options are
-                                    "lru" and "random"
-          --statsd.event-queue-size=10000
-                                    Size of internal queue for processing events
-          --statsd.event-flush-threshold=1000
-                                    Number of events to hold in queue before
-                                    flushing
-          --statsd.event-flush-interval=200ms
-                                    Maximum time between event queue flushes.
-          --debug.dump-fsm=""       The path to dump internal FSM generated for
-                                    glob matching as Dot file.
-          --check-config            Check configuration and exit.
-          --statsd.parse-dogstatsd-tags  
-                                    Parse DogStatsd style tags. Enabled by default.
-          --statsd.parse-influxdb-tags  
-                                    Parse InfluxDB style tags. Enabled by default.
-          --statsd.parse-librato-tags  
-                                    Parse Librato style tags. Enabled by default.
-          --statsd.parse-signalfx-tags  
-                                    Parse SignalFX style tags. Enabled by default.
-          --statsd.relay.address=STATSD.RELAY.ADDRESS  
-                                    The UDP relay target address (host:port)
-          --statsd.relay.packet-length=1400  
-                                    Maximum relay output packet length to avoid fragmentation
-          --log.level=info          Only log messages with the given severity or
-                                    above. One of: [debug, info, warn, error]
-          --log.format=logfmt       Output format of log messages. One of: [logfmt,
-                                    json]
-          --version                 Show application version.
-    ```
+* see `--help` for a full list of flags
 
 ## Lifecycle API
 
@@ -296,7 +236,6 @@ mappings:
   name: "${2}_total"
   labels:
     provider: "$1"
-mappings:
 - match: "(.*)\\.(.*)--(.*)\\.status\.(.*)\\.count"
   match_type: regex
   name: "request_total"
@@ -317,6 +256,27 @@ mappings:
     provider: "$1"
 ```
 
+#### Special match groups
+
+When using regex, the match group `0` is the full match and can be used to attach labels to the metric.
+Example:
+
+```yaml
+mappings:
+- match: ".+"
+  match_type: regex
+  name: "$0"
+  labels:
+    statsd_metric_name: "$0"
+```
+
+If a metric `my.statsd_counter` is received, the metric name will **still** be mapped to `my_statsd_counter` (Prometheus compatible name).
+But the metric will also have the label `statsd_metric_name` with the value `my.statsd_counter` (unchanged value).
+
+Note: If you use the `match` like the example (i.e. `.+`), be aware that it will be a "catch-all" block. So it should come at the very end of the mapping list.
+
+The same is not achievable with glob matching, for more details check [this issue](https://github.com/prometheus/statsd_exporter/issues/444).
+
 ### Naming, labels, and help
 
 Please note that metrics with the same name must also have the same set of
@@ -333,6 +293,13 @@ mappings:
   labels:
     code: "$1"
 ```
+
+### Honor labels
+
+By default, labels specified in the mapping configuration take precedence over tags in the statsd event.
+
+To set the label value to the original tag value, if present, specify `honor_labels: true` in the mapping configuration.
+In this case, the label specified in the mapping acts as a default.
 
 ### StatsD timers and distributions
 
@@ -382,6 +349,8 @@ mappings:
   observer_type: histogram
   histogram_options:
     buckets: [ 0.01, 0.025, 0.05, 0.1 ]
+    native_histogram_bucket_factor: 1.1
+    native_histogram_max_buckets: 256
   name: "my_timer"
   labels:
     provider: "$2"
@@ -395,6 +364,11 @@ values](https://godoc.org/github.com/prometheus/client_golang/prometheus#pkg-var
 are used for the histogram buckets:
 `[.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10]`.
 `+Inf` is added automatically.
+If your Prometheus server is enabled to scrape native histograms (v2.40.0+), 
+then you can set the `native_histogram_bucket_factor` to configure precision of the
+buckets in the sparse histogram. More about this in the original [client_golang docs](https://github.com/prometheus/client_golang/blob/449b46435075e6e069e05af920fe028b941033cf/prometheus/histogram.go#L399-L430).
+Also, a configuration of the maximum number of buckets can be set with `native_histogram_max_buckets`, this
+avoids the histograms to grow too large in memory. More about this in the original [client_golang docs](https://github.com/prometheus/client_golang/blob/449b46435075e6e069e05af920fe028b941033cf/prometheus/histogram.go#L443-L467).
 
 `observer_type` is only used when the statsd metric type is a timer, histogram, or distribution.
 `buckets` is only used when the statsd metric type is one of these, and the `observer_type` is set to `histogram`.
@@ -449,6 +423,8 @@ defaults:
   observer_type: histogram
   histogram_options:
     buckets: [.005, .01, .025, .05, .1, .25, .5, 1, 2.5 ]
+    native_histogram_bucket_factor: 1.1
+    native_histogram_max_buckets: 256
   summary_options:
     quantiles:
       - quantile: 0.99
@@ -528,7 +504,7 @@ Possible values for `match_metric_type` are `gauge`, `counter` and `observer`.
 
 There is a cache used to improve the performance of the metric mapping, that can greatly improvement performance.
 The cache has a default maximum of 1000 unique statsd metric names -> prometheus metrics mappings that it can store.
-This maximum can be adjust using the `statsd.cache-size` flag.
+This maximum can be adjusted using the `statsd.cache-size` flag.
 
 If the maximum is reached, entries are by default rotated using the [least recently used replacement policy](https://en.wikipedia.org/wiki/Cache_replacement_policies#Least_recently_used_(LRU)). This strategy is optimal when memory is constrained as only the most recent entries are retained.
 
@@ -548,7 +524,24 @@ metrics that do not expire.
  expire a metric only by changing the mapping configuration. At least one
  sample must be received for updated mappings to take effect.
 
- ### Event flushing configuration
+### Unit conversions
+
+The `scale` parameter can be used to define unit conversions for metric values. The value is a floating point number to scale metric values by. This can be useful for converting non-base units (e.g. milliseconds, kilobytes) to base units (e.g. seconds, bytes) as recommended in [prometheus best practices](https://prometheus.io/docs/practices/naming/).
+
+```yaml
+mappings:
+- match: foo.latency_ms
+  name: foo_latency_seconds
+  scale: 0.001
+- match: bar.processed_kb
+  name: bar_processed_bytes
+  scale: 1024
+- match: baz.latency_us
+  name: baz_latency_seconds
+  scale: 1e-6
+```
+
+### Event flushing configuration
 
  Internally `statsd_exporter` runs a goroutine for each network listener (UDP, TCP & Unix Socket).  These each receive and parse metrics received into an event.  For performance purposes, these events are queued internally and flushed to the main exporter goroutine periodically in batches.  The size of this queue and the flush criteria can be tuned with the `--statsd.event-queue-size`, `--statsd.event-flush-threshold` and `--statsd.event-flush-interval`.  However, the defaults should perform well even for very high traffic environments.
 
@@ -577,7 +570,6 @@ Semantic versioning of the exporter is based on the impact on users of the expor
 
 We encourage re-use of these packages and welcome [issues](https://github.com/prometheus/statsd_exporter/issues?q=is%3Aopen+is%3Aissue+label%3Alibrary) related to their usability as a library.
 
-[travis]: https://travis-ci.org/prometheus/statsd_exporter
 [circleci]: https://circleci.com/gh/prometheus/statsd_exporter
 [quay]: https://quay.io/repository/prometheus/statsd-exporter
 [hub]: https://hub.docker.com/r/prom/statsd-exporter/

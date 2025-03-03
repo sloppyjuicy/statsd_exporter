@@ -16,6 +16,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -24,19 +25,19 @@ import (
 	"strconv"
 	"syscall"
 
-	"github.com/go-kit/log"
+	"github.com/alecthomas/kingpin/v2"
 	"github.com/prometheus/client_golang/prometheus"
+	versioncollector "github.com/prometheus/client_golang/prometheus/collectors/version"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/prometheus/common/promlog"
-	"github.com/prometheus/common/promlog/flag"
+	"github.com/prometheus/common/promslog"
+	"github.com/prometheus/common/promslog/flag"
 	"github.com/prometheus/common/version"
-	"gopkg.in/alecthomas/kingpin.v2"
+	"github.com/prometheus/exporter-toolkit/web"
 
 	"github.com/prometheus/statsd_exporter/pkg/address"
 	"github.com/prometheus/statsd_exporter/pkg/event"
 	"github.com/prometheus/statsd_exporter/pkg/exporter"
-	"github.com/prometheus/statsd_exporter/pkg/level"
 	"github.com/prometheus/statsd_exporter/pkg/line"
 	"github.com/prometheus/statsd_exporter/pkg/listener"
 	"github.com/prometheus/statsd_exporter/pkg/mapper"
@@ -68,6 +69,12 @@ var (
 		prometheus.CounterOpts{
 			Name: "statsd_exporter_udp_packets_total",
 			Help: "The total number of StatsD packets received over UDP.",
+		},
+	)
+	udpPacketDrops = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "statsd_exporter_udp_packet_drops_total",
+			Help: "The total number of dropped StatsD packets which received over UDP.",
 		},
 	)
 	tcpConnections = promauto.NewCounter(
@@ -141,7 +148,7 @@ var (
 			Name: "statsd_exporter_events_conflict_total",
 			Help: "The total number of StatsD events with conflicting names.",
 		},
-		[]string{"type"},
+		[]string{"type", "metric_name"},
 	)
 	errorEventStats = promauto.NewCounterVec(
 		prometheus.CounterOpts{
@@ -166,49 +173,49 @@ var (
 	)
 )
 
-func serveHTTP(mux http.Handler, listenAddress string, logger log.Logger) {
-	level.Error(logger).Log("msg", http.ListenAndServe(listenAddress, mux))
+func serveHTTP(mux http.Handler, listenAddress string, logger *slog.Logger) {
+	logger.Error(http.ListenAndServe(listenAddress, mux).Error())
 	os.Exit(1)
 }
 
-func sighupConfigReloader(fileName string, mapper *mapper.MetricMapper, logger log.Logger) {
+func sighupConfigReloader(fileName string, mapper *mapper.MetricMapper, logger *slog.Logger) {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGHUP)
 
 	for s := range signals {
 		if fileName == "" {
-			level.Warn(logger).Log("msg", "Received signal but no mapping config to reload", "signal", s)
+			logger.Warn("Received signal but no mapping config to reload", "signal", s)
 			continue
 		}
 
-		level.Info(logger).Log("msg", "Received signal, attempting reload", "signal", s)
+		logger.Info("Received signal, attempting reload", "signal", s)
 
 		reloadConfig(fileName, mapper, logger)
 	}
 }
 
-func reloadConfig(fileName string, mapper *mapper.MetricMapper, logger log.Logger) {
+func reloadConfig(fileName string, mapper *mapper.MetricMapper, logger *slog.Logger) {
 	err := mapper.InitFromFile(fileName)
 	if err != nil {
-		level.Info(logger).Log("msg", "Error reloading config", "error", err)
+		logger.Info("Error reloading config", "error", err)
 		configLoads.WithLabelValues("failure").Inc()
 	} else {
-		level.Info(logger).Log("msg", "Config reloaded successfully")
+		logger.Info("Config reloaded successfully")
 		configLoads.WithLabelValues("success").Inc()
 	}
 }
 
-func dumpFSM(mapper *mapper.MetricMapper, dumpFilename string, logger log.Logger) error {
+func dumpFSM(mapper *mapper.MetricMapper, dumpFilename string, logger *slog.Logger) error {
 	f, err := os.Create(dumpFilename)
 	if err != nil {
 		return err
 	}
-	level.Info(logger).Log("msg", "Start dumping FSM", "file_name", dumpFilename)
+	logger.Info("Start dumping FSM", "file_name", dumpFilename)
 	w := bufio.NewWriter(f)
 	mapper.FSM.DumpFSM(w)
 	w.Flush()
 	f.Close()
-	level.Info(logger).Log("msg", "Finish dumping FSM")
+	logger.Info("Finish dumping FSM")
 	return nil
 }
 
@@ -260,19 +267,17 @@ func main() {
 		signalFXTagsEnabled  = kingpin.Flag("statsd.parse-signalfx-tags", "Parse SignalFX style tags. Enabled by default.").Default("true").Bool()
 		relayAddr            = kingpin.Flag("statsd.relay.address", "The UDP relay target address (host:port)").String()
 		relayPacketLen       = kingpin.Flag("statsd.relay.packet-length", "Maximum relay output packet length to avoid fragmentation").Default("1400").Uint()
+		udpPacketQueueSize   = kingpin.Flag("statsd.udp-packet-queue-size", "Size of internal queue for processing UDP packets.").Default("10000").Int()
 	)
 
-	promlogConfig := &promlog.Config{}
-	flag.AddFlags(kingpin.CommandLine, promlogConfig)
+	promslogConfig := &promslog.Config{}
+	flag.AddFlags(kingpin.CommandLine, promslogConfig)
 	kingpin.Version(version.Print("statsd_exporter"))
+	kingpin.CommandLine.UsageWriter(os.Stdout)
 	kingpin.HelpFlag.Short('h')
 	kingpin.Parse()
-	logger := promlog.New(promlogConfig)
-	if err := level.SetLogLevel(promlogConfig.Level.String()); err != nil {
-		level.Error(logger).Log("msg", "failed to set log level", "error", err)
-		os.Exit(1)
-	}
-	prometheus.MustRegister(version.NewCollector("statsd_exporter"))
+	logger := promslog.New(promslogConfig)
+	prometheus.MustRegister(versioncollector.NewCollector("statsd_exporter"))
 
 	parser := line.NewParser()
 	if *dogstatsdTagsEnabled {
@@ -288,8 +293,8 @@ func main() {
 		parser.EnableSignalFXParsing()
 	}
 
-	level.Info(logger).Log("msg", "Starting StatsD -> Prometheus Exporter", "version", version.Info())
-	level.Info(logger).Log("msg", "Build context", "context", version.BuildContext())
+	logger.Info("Starting StatsD -> Prometheus Exporter", "version", version.Info())
+	logger.Info("Build context", "context", version.BuildContext())
 
 	events := make(chan event.Events, *eventQueueSize)
 	defer close(events)
@@ -299,7 +304,7 @@ func main() {
 
 	cache, err := getCache(*cacheSize, *cacheType, thisMapper.Registerer)
 	if err != nil {
-		level.Error(logger).Log("msg", "Unable to setup metric mapper cache", "error", err)
+		logger.Error("Unable to setup metric mapper cache", "error", err)
 		os.Exit(1)
 	}
 	thisMapper.UseCache(cache)
@@ -307,13 +312,13 @@ func main() {
 	if *mappingConfig != "" {
 		err := thisMapper.InitFromFile(*mappingConfig)
 		if err != nil {
-			level.Error(logger).Log("msg", "error loading config", "error", err)
+			logger.Error("error loading config", "error", err)
 			os.Exit(1)
 		}
 		if *dumpFSMPath != "" {
 			err := dumpFSM(thisMapper, *dumpFSMPath, logger)
 			if err != nil {
-				level.Error(logger).Log("msg", "error dumping FSM", "error", err)
+				logger.Error("error dumping FSM", "error", err)
 				// Failure to dump the FSM is an error (the user asked for it and it
 				// didn't happen) but not fatal (the exporter is fully functional
 				// afterwards).
@@ -324,7 +329,7 @@ func main() {
 	exporter := exporter.NewExporter(prometheus.DefaultRegisterer, thisMapper, logger, eventsActions, eventsUnmapped, errorEventStats, eventStats, conflictingEventStats, metricsCount)
 
 	if *checkConfig {
-		level.Info(logger).Log("msg", "Configuration check successful, exiting")
+		logger.Info("Configuration check successful, exiting")
 		return
 	}
 
@@ -333,38 +338,40 @@ func main() {
 		var err error
 		relayTarget, err = relay.NewRelay(logger, *relayAddr, *relayPacketLen)
 		if err != nil {
-			level.Error(logger).Log("msg", "Unable to create relay", "err", err)
+			logger.Error("Unable to create relay", "err", err)
 			os.Exit(1)
 		}
 	}
 
-	level.Info(logger).Log("msg", "Accepting StatsD Traffic", "udp", *statsdListenUDP, "tcp", *statsdListenTCP, "unixgram", *statsdListenUnixgram)
-	level.Info(logger).Log("msg", "Accepting Prometheus Requests", "addr", *listenAddress)
+	logger.Info("Accepting StatsD Traffic", "udp", *statsdListenUDP, "tcp", *statsdListenTCP, "unixgram", *statsdListenUnixgram)
+	logger.Info("Accepting Prometheus Requests", "addr", *listenAddress)
 
 	if *statsdListenUDP == "" && *statsdListenTCP == "" && *statsdListenUnixgram == "" {
-		level.Error(logger).Log("At least one of UDP/TCP/Unixgram listeners must be specified.")
+		logger.Error("At least one of UDP/TCP/Unixgram listeners must be specified.")
 		os.Exit(1)
 	}
 
 	if *statsdListenUDP != "" {
 		udpListenAddr, err := address.UDPAddrFromString(*statsdListenUDP)
 		if err != nil {
-			level.Error(logger).Log("msg", "invalid UDP listen address", "address", *statsdListenUDP, "error", err)
+			logger.Error("invalid UDP listen address", "address", *statsdListenUDP, "error", err)
 			os.Exit(1)
 		}
 		uconn, err := net.ListenUDP("udp", udpListenAddr)
 		if err != nil {
-			level.Error(logger).Log("msg", "failed to start UDP listener", "error", err)
+			logger.Error("failed to start UDP listener", "error", err)
 			os.Exit(1)
 		}
 
 		if *readBuffer != 0 {
 			err = uconn.SetReadBuffer(*readBuffer)
 			if err != nil {
-				level.Error(logger).Log("msg", "error setting UDP read buffer", "error", err)
+				logger.Error("error setting UDP read buffer", "error", err)
 				os.Exit(1)
 			}
 		}
+
+		udpPacketQueue := make(chan []byte, *udpPacketQueueSize)
 
 		ul := &listener.StatsDUDPListener{
 			Conn:            uconn,
@@ -372,6 +379,7 @@ func main() {
 			Logger:          logger,
 			LineParser:      parser,
 			UDPPackets:      udpPackets,
+			UDPPacketDrops:  udpPacketDrops,
 			LinesReceived:   linesReceived,
 			EventsFlushed:   eventsFlushed,
 			Relay:           relayTarget,
@@ -379,6 +387,7 @@ func main() {
 			SamplesReceived: samplesReceived,
 			TagErrors:       tagErrors,
 			TagsReceived:    tagsReceived,
+			UdpPacketQueue:  udpPacketQueue,
 		}
 
 		go ul.Listen()
@@ -387,12 +396,12 @@ func main() {
 	if *statsdListenTCP != "" {
 		tcpListenAddr, err := address.TCPAddrFromString(*statsdListenTCP)
 		if err != nil {
-			level.Error(logger).Log("msg", "invalid TCP listen address", "address", *statsdListenUDP, "error", err)
+			logger.Error("invalid TCP listen address", "address", *statsdListenUDP, "error", err)
 			os.Exit(1)
 		}
 		tconn, err := net.ListenTCP("tcp", tcpListenAddr)
 		if err != nil {
-			level.Error(logger).Log("msg", err)
+			logger.Error("failed to start TCP listener", "err", err)
 			os.Exit(1)
 		}
 		defer tconn.Close()
@@ -420,7 +429,7 @@ func main() {
 	if *statsdListenUnixgram != "" {
 		var err error
 		if _, err = os.Stat(*statsdListenUnixgram); !os.IsNotExist(err) {
-			level.Error(logger).Log("msg", "Unixgram socket already exists", "socket_name", *statsdListenUnixgram)
+			logger.Error("Unixgram socket already exists", "socket_name", *statsdListenUnixgram)
 			os.Exit(1)
 		}
 		uxgconn, err := net.ListenUnixgram("unixgram", &net.UnixAddr{
@@ -428,7 +437,7 @@ func main() {
 			Name: *statsdListenUnixgram,
 		})
 		if err != nil {
-			level.Error(logger).Log("msg", "failed to listen on Unixgram socket", "error", err)
+			logger.Error("failed to listen on Unixgram socket", "error", err)
 			os.Exit(1)
 		}
 
@@ -437,7 +446,7 @@ func main() {
 		if *readBuffer != 0 {
 			err = uxgconn.SetReadBuffer(*readBuffer)
 			if err != nil {
-				level.Error(logger).Log("msg", "error setting Unixgram read buffer", "error", err)
+				logger.Error("error setting Unixgram read buffer", "error", err)
 				os.Exit(1)
 			}
 		}
@@ -467,11 +476,11 @@ func main() {
 			// convert the string to octet
 			perm, err := strconv.ParseInt("0"+string(*statsdUnixSocketMode), 8, 32)
 			if err != nil {
-				level.Warn(logger).Log("Bad permission %s: %v, ignoring\n", *statsdUnixSocketMode, err)
+				logger.Warn("Bad permission %s: %v, ignoring\n", *statsdUnixSocketMode, err)
 			} else {
 				err = os.Chmod(*statsdListenUnixgram, os.FileMode(perm))
 				if err != nil {
-					level.Warn(logger).Log("Failed to change unixgram socket permission: %v", err)
+					logger.Warn("Failed to change unixgram socket permission", "error", err)
 				}
 			}
 		}
@@ -479,15 +488,25 @@ func main() {
 
 	mux := http.DefaultServeMux
 	mux.Handle(*metricsEndpoint, promhttp.Handler())
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`<html>
-			<head><title>StatsD Exporter</title></head>
-			<body>
-			<h1>StatsD Exporter</h1>
-			<p><a href="` + *metricsEndpoint + `">Metrics</a></p>
-			</body>
-			</html>`))
-	})
+	if *metricsEndpoint != "/" && *metricsEndpoint != "" {
+		landingConfig := web.LandingConfig{
+			Name:        "StatsD Exporter",
+			Description: "Prometheus Exporter for converting StatsD to Prometheus metrics",
+			Version:     version.Info(),
+			Links: []web.LandingLinks{
+				{
+					Address: *metricsEndpoint,
+					Text:    "Metrics",
+				},
+			},
+		}
+		landingPage, err := web.NewLandingPage(landingConfig)
+		if err != nil {
+			logger.Error("error creating landing page", "err", err)
+			os.Exit(1)
+		}
+		mux.Handle("/", landingPage)
+	}
 
 	quitChan := make(chan struct{}, 1)
 
@@ -496,10 +515,10 @@ func main() {
 			if r.Method == http.MethodPut || r.Method == http.MethodPost {
 				fmt.Fprintf(w, "Requesting reload")
 				if *mappingConfig == "" {
-					level.Warn(logger).Log("msg", "Received lifecycle api reload but no mapping config to reload")
+					logger.Warn("Received lifecycle api reload but no mapping config to reload")
 					return
 				}
-				level.Info(logger).Log("msg", "Received lifecycle api reload, attempting reload")
+				logger.Info("Received lifecycle api reload, attempting reload")
 				reloadConfig(*mappingConfig, thisMapper, logger)
 			}
 		})
@@ -513,7 +532,7 @@ func main() {
 
 	mux.HandleFunc("/-/healthy", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
-			level.Debug(logger).Log("msg", "Received health check")
+			logger.Debug("Received health check")
 			w.WriteHeader(http.StatusOK)
 			fmt.Fprintf(w, "Statsd Exporter is Healthy.\n")
 		}
@@ -521,7 +540,7 @@ func main() {
 
 	mux.HandleFunc("/-/ready", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
-			level.Debug(logger).Log("msg", "Received ready check")
+			logger.Debug("Received ready check")
 			w.WriteHeader(http.StatusOK)
 			fmt.Fprintf(w, "Statsd Exporter is Ready.\n")
 		}
@@ -538,8 +557,8 @@ func main() {
 	// quit if we get a message on either channel
 	select {
 	case sig := <-signals:
-		level.Info(logger).Log("msg", "Received os signal, exiting", "signal", sig.String())
+		logger.Info("Received os signal, exiting", "signal", sig.String())
 	case <-quitChan:
-		level.Info(logger).Log("msg", "Received lifecycle api quit, exiting")
+		logger.Info("Received lifecycle api quit, exiting")
 	}
 }

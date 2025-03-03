@@ -1,3 +1,91 @@
+## 0.28.0 / 2024-10-25
+
+* [CHANGE] Update exporter-toolkit & switch to slog ([#586](https://github.com/prometheus/statsd_exporter/pull/586))
+* [CHANGE] Update client_golang and prometheus-common
+
+This is a breaking change for library users.
+
+## 0.27.2 / 2024-10-07
+
+* [BUGFIX] Fix panic on certain invalid lines ([#579](https://github.com/prometheus/statsd_exporter/pull/579))
+
+## 0.27.1 / 2024-08-18
+
+* [FEATURE] Support [dogstatsd extended aggregation](https://github.com/DataDog/datadog-go/blob/master/README.md#extended-aggregation) ([#558](https://github.com/prometheus/statsd_exporter/pull/558))
+* [SECURITY] Update dependencies
+
+Thank you [@GrgDev](https://github.com/GrgDev) for the contribution!
+
+## 0.26.1 / 2024-03-22
+
+* [SECURITY] Update dependencies, including `google.golang.org/protobuf` for CVE-2024-24786
+
+This is a maintenance release.
+
+## 0.26.0 / 2023-12-06
+
+* [CHANGE] Update dependencies: prometheus/common, client model, and Go 1.21
+* [FEATURE] Add option to honor original labels from event tags over labels specified in mapping configuration ([#521](https://github.com/prometheus/statsd_exporter/pull/521))
+
+Thank you @rabenhorst for the `honor_labels` contribution!
+
+## 0.25.0 / 2023-10-23
+
+* [CHANGE] Update `client_golang` ([#508](https://github.com/prometheus/statsd_exporter/pull/508), [#513](https://github.com/prometheus/statsd_exporter/pull/513))
+* [ENHANCEMENT] Process UDP packets asynchronously ([#511](https://github.com/prometheus/statsd_exporter/pull/511))
+* [BUGFIX] Debug-log incoming lines in cleartext ([#510](https://github.com/prometheus/statsd_exporter/pull/510))
+* [SECURITY] Update `golang.org/x/net` ([#516](https://github.com/prometheus/statsd_exporter/pull/516))
+
+This release is less likely to drop UDP packets under very high traffic.
+Additionally, when it does, it now attempts to record that this happened in the metric `statsd_exporter_udp_packet_drops_total`, where previously this could only be detected from operating system metrics.
+If you are already monitoring for OS-level UDP packet drops, you _must_ also monitor this metric.
+The exporter will pull packets from the UDP socket queue much more quickly and queue them internally before processing.
+Existing monitoring for packet drops will no longer be sufficient to detect dropped events, but attribution to the exporter is easier with this new metric.
+
+Many thanks to @sumeshpremraj and @kullanici0606 for their contributions, and @pedro-stanaka for helping with the async UDP processing!
+
+## 0.24.0 / 2023-06-02
+
+* [FEATURE] Improve the landing page experience ([#504](https://github.com/prometheus/statsd_exporter/pull/504))
+* [FEATURE] Support scaling parameter in mapping ([#499](https://github.com/prometheus/statsd_exporter/pull/499))
+
+## 0.23.3 / 2023-06-02
+
+* [SECURITY] Maintenance release, updating dependencies
+* [ENHANCEMENT][library] Allow instantiating configuration without going through YAML ([#491](https://github.com/prometheus/statsd_exporter/pull/491))
+
+Version 0.23.2 was mistagged and thus skipped.
+
+## 0.23.1 / 2023-03-08
+
+* [SECURITY] Update all dependencies ([#489](https://github.com/prometheus/statsd_exporter/pull/489))
+
+## 0.23.0 / 2022-12-07
+
+* [CHANGE] Print help and version to standard out ([#469](https://github.com/prometheus/statsd_exporter/pull/469))
+* [FEATURE] Support experimental native histograms ([#474](https://github.com/prometheus/statsd_exporter/pull/474))
+
+## 0.22.8 / 2022-09-13
+
+* [BUGFIX] Prevent poisoning with gauge/distribution naming collision ([#461](https://github.com/prometheus/statsd_exporter/pull/461))
+* [CHANGE] Update `client_golang` dependency ([#463](https://github.com/prometheus/statsd_exporter/pull/463))
+
+## 0.22.7 / 2022-07-08
+
+* [CHANGE] Build with Go 1.18 ([#450](https://github.com/prometheus/statsd_exporter/pull/450))
+
+## 0.22.6 / 2022-07-08
+
+* [CHANGE] Update dependencies ([#449](https://github.com/prometheus/statsd_exporter/pull/449))
+
+This is another housekeeping release.
+
+## 0.22.5 / 2022-05-06
+
+* [ENHANCEMENT] Add metric for total lines relayed ([#434](https://github.com/prometheus/statsd_exporter/pull/434))
+
+This release is built with Go 1.17.9, to address security issues in Go.
+
 ## 0.22.4 / 2021-11-26
 
 * [BUGFIX] Make Docker image compatible with the runAsNonRoot setting in Kubernetes pods ([#409](https://github.com/prometheus/statsd_exporter/pull/409))
@@ -388,7 +476,6 @@ NOTE: This release renames `statsd_bridge` to `statsd_exporter`
 * [BUGFIX] allow metrics with dashes when mapping ([#24](https://github.com/prometheus/statsd_exporter/pulls/24))
 * [ENHANCEMENT] add root endpoint with redirect ([#25](https://github.com/prometheus/statsd_exporter/pulls/25))
 * [CHANGE] rename bridge to exporter ([#26](https://github.com/prometheus/statsd_exporter/pulls/26))
-
 
 ## 0.1.0 / 2015-04-17
 
